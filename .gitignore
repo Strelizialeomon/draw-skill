@@ -3,3 +3,5 @@ smoke/
 out/
 __pycache__/
 *.pyc
+.idea/
+.DS_Store
