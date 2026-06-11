@@ -64,5 +64,52 @@ class TestSubmit(unittest.TestCase):
             draw.submit("x", base="b", api_key="k", model="m", aspect="a", refs=[], post=fake_post)
 
 
+class TestPollSuccess(unittest.TestCase):
+    def test_returns_urls_on_succeeded(self):
+        responses = iter([
+            {"code": 0, "data": {"status": "running", "progress": 30, "results": []}},
+            {"code": 0, "data": {"status": "succeeded", "progress": 100,
+                                 "results": [{"url": "https://img/a.png"},
+                                             {"url": "https://img/b.png"}]}},
+        ])
+        calls = {"n": 0}
+
+        def fake_post(url, api_key, body):
+            self.assertEqual(url, "https://api.example.com/v1/draw/result")
+            self.assertEqual(body, {"id": "task-123"})
+            calls["n"] += 1
+            return next(responses)
+
+        urls = draw.poll(
+            "task-123",
+            base="https://api.example.com",
+            api_key="sk",
+            interval=3,
+            timeout=300,
+            post=fake_post,
+            sleep=lambda s: None,
+            now=lambda: 0.0,
+            log=lambda m: None,
+        )
+        self.assertEqual(urls, ["https://img/a.png", "https://img/b.png"])
+        self.assertEqual(calls["n"], 2)
+
+    def test_raises_on_nonzero_code(self):
+        def fake_post(url, api_key, body):
+            return {"code": 1, "msg": "boom"}
+
+        with self.assertRaises(draw.DrawError):
+            draw.poll("x", base="b", api_key="k", interval=0, timeout=10,
+                      post=fake_post, sleep=lambda s: None, now=lambda: 0.0, log=lambda m: None)
+
+    def test_raises_when_succeeded_but_no_urls(self):
+        def fake_post(url, api_key, body):
+            return {"code": 0, "data": {"status": "succeeded", "results": []}}
+
+        with self.assertRaises(draw.DrawError):
+            draw.poll("x", base="b", api_key="k", interval=0, timeout=10,
+                      post=fake_post, sleep=lambda s: None, now=lambda: 0.0, log=lambda m: None)
+
+
 if __name__ == "__main__":
     unittest.main()

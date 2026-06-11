@@ -27,3 +27,27 @@ def submit(prompt, *, base, api_key, model, aspect, refs, post):
     if not task_id:
         raise DrawError("提交成功但返回里没有 data.id")
     return task_id
+
+
+def poll(task_id, *, base, api_key, interval, timeout, post,
+         sleep=time.sleep, now=time.monotonic, log=lambda m: None):
+    url = base.rstrip("/") + "/v1/draw/result"
+    deadline = now() + timeout
+    while True:
+        resp = post(url, api_key, {"id": task_id})
+        if resp.get("code") != 0:
+            raise DrawError(f"查询失败: {resp.get('msg')}")
+        data = resp.get("data", {})
+        status = data.get("status")
+        if status == "succeeded":
+            urls = [r["url"] for r in data.get("results", []) if r.get("url")]
+            if not urls:
+                raise DrawError("任务已完成但没有返回图片 URL")
+            return urls
+        if status == "failed":
+            reason = data.get("failure_reason") or data.get("error") or "未知原因"
+            raise DrawError(f"生成失败: {reason}")
+        log(f"进度 {data.get('progress', 0)}% ({status})")
+        if now() >= deadline:
+            raise DrawError(f"已等待 {timeout} 秒仍未完成，最后进度 {data.get('progress', 0)}%")
+        sleep(interval)
