@@ -124,12 +124,18 @@ python3 draw.py "<prompt>" \
 |---|---|---|
 | `IMAGE_API_KEY` | 是 | Bearer token |
 | `IMAGE_API_BASE` | 是 | 接口域名，如 `https://api.example.com`（不含路径） |
+| `IMAGE_MODEL` | 否 | 默认模型名；不设则回落 `gpt-image-2` |
 
 - **绝不在脚本里硬编码 key**。
-- 缺失时给出清楚的中文报错，提示用户先 `export`。
+- 缺失（指必填项）时给出清楚的中文报错，提示用户先 `export`。
 
-可选默认值（写死在脚本里，可被参数覆盖）：
-- `model = gpt-image-2`
+**模型选择优先级**（高 → 低）：
+
+1. `--model` 命令行参数（当场显式指定）
+2. `IMAGE_MODEL` 环境变量 / `.env`（持久默认，省得每次敲）
+3. 兜底常量 `gpt-image-2`
+
+其它可选默认值（写死在脚本里，可被参数覆盖）：
 - `aspect = 1024x1024`
 - 轮询间隔 `3` 秒，超时 `300` 秒。
 
