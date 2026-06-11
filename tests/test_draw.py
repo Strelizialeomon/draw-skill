@@ -140,5 +140,31 @@ class TestPollFailAndTimeout(unittest.TestCase):
         self.assertIn("仍未完成", str(ctx.exception))
 
 
+class TestDownload(unittest.TestCase):
+    def test_writes_file_and_returns_abspath(self):
+        import os
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            def fake_fetch(url):
+                self.assertEqual(url, "https://img/a.png")
+                return b"PNGDATA"
+
+            path = draw.download("https://img/a.png", d, "task-123", 1, fetch=fake_fetch)
+
+            self.assertTrue(os.path.isabs(path))
+            self.assertEqual(os.path.basename(path), "draw-task-123-1.png")
+            with open(path, "rb") as f:
+                self.assertEqual(f.read(), b"PNGDATA")
+
+    def test_creates_missing_out_dir(self):
+        import os
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            nested = os.path.join(d, "imgs")
+            path = draw.download("https://img/a.png", nested, "t", 2, fetch=lambda u: b"x")
+            self.assertTrue(os.path.exists(path))
+            self.assertEqual(os.path.basename(path), "draw-t-2.png")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -51,3 +51,13 @@ def poll(task_id, *, base, api_key, interval, timeout, post,
         if now() >= deadline:
             raise DrawError(f"已等待 {timeout} 秒仍未完成，最后进度 {data.get('progress', 0)}%")
         sleep(interval)
+
+
+def download(url, out_dir, task_id, index, *, fetch=None):
+    fetch = fetch or _http_get_bytes
+    os.makedirs(out_dir, exist_ok=True)
+    filename = f"draw-{task_id}-{index}.png"
+    path = os.path.abspath(os.path.join(out_dir, filename))
+    with open(path, "wb") as f:
+        f.write(fetch(url))
+    return path
