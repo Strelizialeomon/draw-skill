@@ -111,5 +111,34 @@ class TestPollSuccess(unittest.TestCase):
                       post=fake_post, sleep=lambda s: None, now=lambda: 0.0, log=lambda m: None)
 
 
+class TestPollFailAndTimeout(unittest.TestCase):
+    def test_raises_on_failed_status_with_reason(self):
+        def fake_post(url, api_key, body):
+            return {"code": 0, "data": {"status": "failed",
+                                        "failure_reason": "nsfw", "error": ""}}
+
+        with self.assertRaises(draw.DrawError) as ctx:
+            draw.poll("x", base="b", api_key="k", interval=0, timeout=10,
+                      post=fake_post, sleep=lambda s: None, now=lambda: 0.0, log=lambda m: None)
+        self.assertIn("nsfw", str(ctx.exception))
+
+    def test_raises_on_timeout(self):
+        clock = {"t": 0.0}
+
+        def fake_now():
+            return clock["t"]
+
+        def fake_sleep(s):
+            clock["t"] += 5.0  # 每次 sleep 推进 5 秒，迅速越过 deadline
+
+        def fake_post(url, api_key, body):
+            return {"code": 0, "data": {"status": "running", "progress": 10}}
+
+        with self.assertRaises(draw.DrawError) as ctx:
+            draw.poll("x", base="b", api_key="k", interval=3, timeout=10,
+                      post=fake_post, sleep=fake_sleep, now=fake_now, log=lambda m: None)
+        self.assertIn("仍未完成", str(ctx.exception))
+
+
 if __name__ == "__main__":
     unittest.main()
