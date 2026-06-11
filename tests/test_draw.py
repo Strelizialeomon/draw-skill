@@ -1,150 +1,110 @@
+import contextlib
+import io
 import json
+import os
+import tempfile
 import unittest
+import urllib.error
+
 import draw
 
 
-class TestSubmit(unittest.TestCase):
-    def test_returns_id_and_builds_text_body(self):
-        captured = {}
+# ---------------------------------------------------------------------------
+# _parse_sse_event
+# ---------------------------------------------------------------------------
+class TestParseSseEvent(unittest.TestCase):
+    def test_parses_data_line(self):
+        ev = draw._parse_sse_event('data: {"status":"running","progress":5}')
+        self.assertEqual(ev, {"status": "running", "progress": 5})
 
-        def fake_post(url, api_key, body):
+    def test_non_data_line_returns_none(self):
+        self.assertIsNone(draw._parse_sse_event(""))
+        self.assertIsNone(draw._parse_sse_event(":keepalive"))
+        self.assertIsNone(draw._parse_sse_event("event: ping"))
+
+    def test_empty_payload_returns_none(self):
+        self.assertIsNone(draw._parse_sse_event("data: "))
+
+
+# ---------------------------------------------------------------------------
+# generate
+# ---------------------------------------------------------------------------
+class TestGenerate(unittest.TestCase):
+    def test_streams_progress_then_returns_id_and_urls(self):
+        captured = {}
+        logs = []
+
+        def fake_stream(url, api_key, body):
             captured["url"] = url
             captured["api_key"] = api_key
             captured["body"] = body
-            return {"code": 0, "msg": "success", "data": {"id": "task-123"}}
+            yield 'data: {"id":"task-9","status":"running","progress":30,"results":null}'
+            yield ''
+            yield ('data: {"id":"task-9","status":"succeeded","progress":100,'
+                   '"results":[{"url":"https://img/a.png"},{"url":"https://img/b.png"}]}')
 
-        task_id = draw.submit(
+        task_id, urls = draw.generate(
             "a cat",
             base="https://api.example.com",
-            api_key="sk-xxx",
+            api_key="sk",
             model="gpt-image-2",
             aspect="1024x1024",
             refs=[],
-            post=fake_post,
+            open_stream=fake_stream,
+            log=logs.append,
         )
 
-        self.assertEqual(task_id, "task-123")
+        self.assertEqual(task_id, "task-9")
+        self.assertEqual(urls, ["https://img/a.png", "https://img/b.png"])
         self.assertEqual(captured["url"], "https://api.example.com/v1/draw/completions")
-        self.assertEqual(captured["api_key"], "sk-xxx")
-        self.assertEqual(
-            captured["body"],
-            {"model": "gpt-image-2", "prompt": "a cat", "aspectRatio": "1024x1024"},
-        )
+        self.assertEqual(captured["api_key"], "sk")
+        self.assertEqual(captured["body"]["shutProgress"], False)
         self.assertNotIn("urls", captured["body"])
+        self.assertTrue(any("30" in m for m in logs))
 
-    def test_includes_refs_when_present(self):
+    def test_includes_refs_in_body(self):
         captured = {}
 
-        def fake_post(url, api_key, body):
+        def fake_stream(url, api_key, body):
             captured["body"] = body
-            return {"code": 0, "data": {"id": "x"}}
+            yield 'data: {"id":"x","status":"succeeded","results":[{"url":"u"}]}'
 
-        draw.submit(
-            "a cat",
-            base="https://api.example.com/",
-            api_key="sk",
-            model="m",
-            aspect="1024x1024",
-            refs=["https://img/1.png"],
-            post=fake_post,
-        )
+        draw.generate("a cat", base="https://api.example.com/", api_key="sk",
+                      model="m", aspect="1024x1024", refs=["https://img/1.png"],
+                      open_stream=fake_stream, log=lambda m: None)
         self.assertEqual(captured["body"]["urls"], ["https://img/1.png"])
 
-    def test_raises_on_nonzero_code(self):
-        def fake_post(url, api_key, body):
-            return {"code": 1, "msg": "bad key", "data": {}}
-
-        with self.assertRaises(draw.DrawError):
-            draw.submit("x", base="b", api_key="k", model="m", aspect="a", refs=[], post=fake_post)
-
-    def test_raises_when_no_id(self):
-        def fake_post(url, api_key, body):
-            return {"code": 0, "data": {}}
-
-        with self.assertRaises(draw.DrawError):
-            draw.submit("x", base="b", api_key="k", model="m", aspect="a", refs=[], post=fake_post)
-
-
-class TestPollSuccess(unittest.TestCase):
-    def test_returns_urls_on_succeeded(self):
-        responses = iter([
-            {"code": 0, "data": {"status": "running", "progress": 30, "results": []}},
-            {"code": 0, "data": {"status": "succeeded", "progress": 100,
-                                 "results": [{"url": "https://img/a.png"},
-                                             {"url": "https://img/b.png"}]}},
-        ])
-        calls = {"n": 0}
-
-        def fake_post(url, api_key, body):
-            self.assertEqual(url, "https://api.example.com/v1/draw/result")
-            self.assertEqual(body, {"id": "task-123"})
-            calls["n"] += 1
-            return next(responses)
-
-        urls = draw.poll(
-            "task-123",
-            base="https://api.example.com",
-            api_key="sk",
-            interval=3,
-            timeout=300,
-            post=fake_post,
-            sleep=lambda s: None,
-            now=lambda: 0.0,
-            log=lambda m: None,
-        )
-        self.assertEqual(urls, ["https://img/a.png", "https://img/b.png"])
-        self.assertEqual(calls["n"], 2)
-
-    def test_raises_on_nonzero_code(self):
-        def fake_post(url, api_key, body):
-            return {"code": 1, "msg": "boom"}
-
-        with self.assertRaises(draw.DrawError):
-            draw.poll("x", base="b", api_key="k", interval=0, timeout=10,
-                      post=fake_post, sleep=lambda s: None, now=lambda: 0.0, log=lambda m: None)
-
-    def test_raises_when_succeeded_but_no_urls(self):
-        def fake_post(url, api_key, body):
-            return {"code": 0, "data": {"status": "succeeded", "results": []}}
-
-        with self.assertRaises(draw.DrawError):
-            draw.poll("x", base="b", api_key="k", interval=0, timeout=10,
-                      post=fake_post, sleep=lambda s: None, now=lambda: 0.0, log=lambda m: None)
-
-
-class TestPollFailAndTimeout(unittest.TestCase):
-    def test_raises_on_failed_status_with_reason(self):
-        def fake_post(url, api_key, body):
-            return {"code": 0, "data": {"status": "failed",
-                                        "failure_reason": "nsfw", "error": ""}}
+    def test_raises_on_failed(self):
+        def fake_stream(url, api_key, body):
+            yield 'data: {"id":"x","status":"failed","failure_reason":"nsfw","error":""}'
 
         with self.assertRaises(draw.DrawError) as ctx:
-            draw.poll("x", base="b", api_key="k", interval=0, timeout=10,
-                      post=fake_post, sleep=lambda s: None, now=lambda: 0.0, log=lambda m: None)
+            draw.generate("x", base="b", api_key="k", model="m", aspect="a",
+                          refs=[], open_stream=fake_stream, log=lambda m: None)
         self.assertIn("nsfw", str(ctx.exception))
 
-    def test_raises_on_timeout(self):
-        clock = {"t": 0.0}
+    def test_raises_when_succeeded_but_no_results(self):
+        def fake_stream(url, api_key, body):
+            yield 'data: {"id":"x","status":"succeeded","results":[]}'
 
-        def fake_now():
-            return clock["t"]
+        with self.assertRaises(draw.DrawError):
+            draw.generate("x", base="b", api_key="k", model="m", aspect="a",
+                          refs=[], open_stream=fake_stream, log=lambda m: None)
 
-        def fake_sleep(s):
-            clock["t"] += 5.0  # 每次 sleep 推进 5 秒，迅速越过 deadline
+    def test_raises_when_stream_ends_without_terminal(self):
+        def fake_stream(url, api_key, body):
+            yield 'data: {"id":"x","status":"running","progress":50}'
 
-        def fake_post(url, api_key, body):
-            return {"code": 0, "data": {"status": "running", "progress": 10}}
-
-        with self.assertRaises(draw.DrawError) as ctx:
-            draw.poll("x", base="b", api_key="k", interval=3, timeout=10,
-                      post=fake_post, sleep=fake_sleep, now=fake_now, log=lambda m: None)
-        self.assertIn("仍未完成", str(ctx.exception))
+        with self.assertRaises(draw.DrawError):
+            draw.generate("x", base="b", api_key="k", model="m", aspect="a",
+                          refs=[], open_stream=fake_stream, log=lambda m: None)
 
 
+# ---------------------------------------------------------------------------
+# download
+# ---------------------------------------------------------------------------
 class TestDownload(unittest.TestCase):
     def test_writes_file_and_returns_abspath(self):
-        import os
-        import tempfile
         with tempfile.TemporaryDirectory() as d:
             def fake_fetch(url):
                 self.assertEqual(url, "https://img/a.png")
@@ -158,21 +118,27 @@ class TestDownload(unittest.TestCase):
                 self.assertEqual(f.read(), b"PNGDATA")
 
     def test_creates_missing_out_dir(self):
-        import os
-        import tempfile
         with tempfile.TemporaryDirectory() as d:
             nested = os.path.join(d, "imgs")
             path = draw.download("https://img/a.png", nested, "t", 2, fetch=lambda u: b"x")
             self.assertTrue(os.path.exists(path))
             self.assertEqual(os.path.basename(path), "draw-t-2.png")
 
+    def test_extension_taken_from_url(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = draw.download("https://img/a.webp", d, "t", 1, fetch=lambda u: b"x")
+            self.assertEqual(os.path.basename(path), "draw-t-1.webp")
 
-class _FakeResp:
-    def __init__(self, payload):
-        self._payload = payload
 
-    def read(self):
-        return self._payload
+# ---------------------------------------------------------------------------
+# _http_post_stream
+# ---------------------------------------------------------------------------
+class _FakeStreamResp:
+    def __init__(self, lines):
+        self._lines = lines
+
+    def __iter__(self):
+        return iter(self._lines)
 
     def __enter__(self):
         return self
@@ -181,37 +147,31 @@ class _FakeResp:
         return False
 
 
-class TestHttpPost(unittest.TestCase):
-    def test_sends_json_with_bearer_and_parses_response(self):
+class TestHttpPostStream(unittest.TestCase):
+    def test_yields_decoded_lines_with_bearer(self):
         captured = {}
 
-        def fake_urlopen(req):
-            captured["url"] = req.full_url
-            captured["method"] = req.get_method()
+        def fake_urlopen(req, timeout=None):
             captured["auth"] = req.get_header("Authorization")
-            captured["ctype"] = req.get_header("Content-type")
+            captured["method"] = req.get_method()
             captured["data"] = req.data
-            return _FakeResp(b'{"code":0,"data":{"id":"abc"}}')
+            return _FakeStreamResp([b"data: {\"a\":1}\n", b"\n"])
 
         orig = draw.urllib.request.urlopen
         draw.urllib.request.urlopen = fake_urlopen
         try:
-            out = draw._http_post("https://api.example.com/v1/draw/completions",
-                                  "sk-key", {"prompt": "x"})
+            lines = list(draw._http_post_stream("https://api.example.com/v1/draw/completions",
+                                                "sk-key", {"prompt": "x"}, timeout=5))
         finally:
             draw.urllib.request.urlopen = orig
 
-        self.assertEqual(out, {"code": 0, "data": {"id": "abc"}})
-        self.assertEqual(captured["method"], "POST")
+        self.assertEqual(lines, ['data: {"a":1}\n', "\n"])
         self.assertEqual(captured["auth"], "Bearer sk-key")
-        self.assertEqual(captured["ctype"], "application/json")
+        self.assertEqual(captured["method"], "POST")
         self.assertEqual(json.loads(captured["data"].decode()), {"prompt": "x"})
 
     def test_maps_httperror_to_drawerror(self):
-        import io
-        import urllib.error
-
-        def fake_urlopen(req):
+        def fake_urlopen(req, timeout=None):
             raise urllib.error.HTTPError(req.full_url, 401, "Unauthorized", {},
                                          io.BytesIO(b"no access"))
 
@@ -219,15 +179,17 @@ class TestHttpPost(unittest.TestCase):
         draw.urllib.request.urlopen = fake_urlopen
         try:
             with self.assertRaises(draw.DrawError) as ctx:
-                draw._http_post("https://api.example.com/x", "k", {})
+                list(draw._http_post_stream("https://api.example.com/x", "k", {}, timeout=5))
         finally:
             draw.urllib.request.urlopen = orig
         self.assertIn("401", str(ctx.exception))
 
 
+# ---------------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------------
 class TestMain(unittest.TestCase):
     def test_missing_env_returns_2(self):
-        import os
         orig = dict(os.environ)
         os.environ.pop("IMAGE_API_KEY", None)
         os.environ.pop("IMAGE_API_BASE", None)
@@ -239,54 +201,46 @@ class TestMain(unittest.TestCase):
         self.assertEqual(rc, 2)
 
     def test_happy_path_prints_paths_and_returns_0(self):
-        import contextlib
-        import io
-        import os
         orig = dict(os.environ)
         os.environ["IMAGE_API_KEY"] = "sk"
         os.environ["IMAGE_API_BASE"] = "https://api.example.com"
-        orig_submit, orig_poll, orig_download = draw.submit, draw.poll, draw.download
-        draw.submit = lambda prompt, **kw: "task-9"
-        draw.poll = lambda task_id, **kw: ["https://img/a.png"]
+        orig_gen, orig_dl = draw.generate, draw.download
+        draw.generate = lambda prompt, **kw: ("task-9", ["https://img/a.png"])
         draw.download = lambda url, out, tid, idx, **kw: f"/abs/draw-{tid}-{idx}.png"
         buf = io.StringIO()
         try:
             with contextlib.redirect_stdout(buf):
                 rc = draw.main(["a cat", "--out", "."])
         finally:
-            draw.submit, draw.poll, draw.download = orig_submit, orig_poll, orig_download
+            draw.generate, draw.download = orig_gen, orig_dl
             os.environ.clear()
             os.environ.update(orig)
         self.assertEqual(rc, 0)
         self.assertIn("/abs/draw-task-9-1.png", buf.getvalue())
 
     def test_url_only_prints_urls(self):
-        import contextlib
-        import io
-        import os
         orig = dict(os.environ)
         os.environ["IMAGE_API_KEY"] = "sk"
         os.environ["IMAGE_API_BASE"] = "https://api.example.com"
-        orig_submit, orig_poll = draw.submit, draw.poll
-        draw.submit = lambda prompt, **kw: "t"
-        draw.poll = lambda task_id, **kw: ["https://img/x.png"]
+        orig_gen = draw.generate
+        draw.generate = lambda prompt, **kw: ("t", ["https://img/x.png"])
         buf = io.StringIO()
         try:
             with contextlib.redirect_stdout(buf):
                 rc = draw.main(["a cat", "--url-only"])
         finally:
-            draw.submit, draw.poll = orig_submit, orig_poll
+            draw.generate = orig_gen
             os.environ.clear()
             os.environ.update(orig)
         self.assertEqual(rc, 0)
         self.assertIn("https://img/x.png", buf.getvalue())
 
 
+# ---------------------------------------------------------------------------
+# model selection precedence
+# ---------------------------------------------------------------------------
 class TestModelSelection(unittest.TestCase):
     def _captured_model(self, argv, env):
-        import contextlib
-        import io
-        import os
         orig = dict(os.environ)
         os.environ["IMAGE_API_KEY"] = "sk"
         os.environ["IMAGE_API_BASE"] = "https://api.example.com"
@@ -295,19 +249,18 @@ class TestModelSelection(unittest.TestCase):
             os.environ[k] = v
         captured = {}
 
-        def fake_submit(prompt, **kw):
+        def fake_generate(prompt, **kw):
             captured["model"] = kw.get("model")
-            return "t"
+            return ("t", ["https://img/a.png"])
 
-        orig_submit, orig_poll, orig_download = draw.submit, draw.poll, draw.download
-        draw.submit = fake_submit
-        draw.poll = lambda task_id, **kw: ["https://img/a.png"]
+        orig_gen, orig_dl = draw.generate, draw.download
+        draw.generate = fake_generate
         draw.download = lambda url, out, tid, idx, **kw: "/abs/x.png"
         try:
             with contextlib.redirect_stdout(io.StringIO()):
                 draw.main(argv)
         finally:
-            draw.submit, draw.poll, draw.download = orig_submit, orig_poll, orig_download
+            draw.generate, draw.download = orig_gen, orig_dl
             os.environ.clear()
             os.environ.update(orig)
         return captured["model"]

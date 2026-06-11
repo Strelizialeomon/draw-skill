@@ -1,69 +1,75 @@
 #!/usr/bin/env python3
-"""异步生图接口封装：提交 -> 轮询 -> 下载。零第三方依赖。"""
+"""生图接口封装：流式发起 -> 读进度 -> 下载成图。零第三方依赖。
+
+接口 /v1/draw/completions 是 SSE 流式：连接挂住，逐条推 `data: {事件}`，
+每个事件是扁平 JSON（含 status/progress/results），直到 succeeded 或 failed。
+"""
 
 import argparse
 import json
 import os
 import sys
-import time
 import urllib.error
 import urllib.parse
 import urllib.request
+
+_STREAM_TIMEOUT = 300  # 流读取默认超时秒
 
 
 class DrawError(Exception):
     """业务/接口错误，main() 捕获后转为非零退出码。"""
 
 
-def submit(prompt, *, base, api_key, model, aspect, refs, post):
-    body = {"model": model, "prompt": prompt, "aspectRatio": aspect}
+def _parse_sse_event(line):
+    """把一行 SSE 文本解析成事件 dict；非 data 行或空 payload 返回 None。"""
+    line = line.strip()
+    if not line.startswith("data:"):
+        return None
+    payload = line[len("data:"):].strip()
+    if not payload:
+        return None
+    return json.loads(payload)
+
+
+def generate(prompt, *, base, api_key, model, aspect, refs, open_stream, log=lambda m: None):
+    """发起生图并消费事件流，返回 (task_id, [图片URL...])。"""
+    body = {"model": model, "prompt": prompt, "aspectRatio": aspect, "shutProgress": False}
     if refs:
         body["urls"] = refs
     url = base.rstrip("/") + "/v1/draw/completions"
-    resp = post(url, api_key, body)
-    if resp.get("code") != 0:
-        raise DrawError(f"提交失败: {resp.get('msg')}")
-    task_id = resp.get("data", {}).get("id")
-    if not task_id:
-        raise DrawError("提交成功但返回里没有 data.id")
-    return task_id
 
-
-def poll(task_id, *, base, api_key, interval, timeout, post,
-         sleep=time.sleep, now=time.monotonic, log=lambda m: None):
-    url = base.rstrip("/") + "/v1/draw/result"
-    deadline = now() + timeout
-    while True:
-        resp = post(url, api_key, {"id": task_id})
-        if resp.get("code") != 0:
-            raise DrawError(f"查询失败: {resp.get('msg')}")
-        data = resp.get("data", {})
-        status = data.get("status")
-        if status == "succeeded":
-            urls = [r["url"] for r in data.get("results", []) if r.get("url")]
+    last_status = None
+    for line in open_stream(url, api_key, body):
+        event = _parse_sse_event(line)
+        if event is None:
+            continue
+        last_status = event.get("status")
+        if last_status == "succeeded":
+            task_id = event.get("id") or "img"
+            urls = [r["url"] for r in (event.get("results") or []) if r.get("url")]
             if not urls:
-                raise DrawError("任务已完成但没有返回图片 URL")
-            return urls
-        if status == "failed":
-            reason = data.get("failure_reason") or data.get("error") or "未知原因"
+                raise DrawError("生成完成但没有返回图片 URL")
+            return task_id, urls
+        if last_status == "failed":
+            reason = event.get("failure_reason") or event.get("error") or "未知原因"
             raise DrawError(f"生成失败: {reason}")
-        log(f"进度 {data.get('progress', 0)}% ({status})")
-        if now() >= deadline:
-            raise DrawError(f"已等待 {timeout} 秒仍未完成，最后进度 {data.get('progress', 0)}%")
-        sleep(interval)
+        log(f"进度 {event.get('progress', 0)}% ({last_status})")
+    raise DrawError(f"连接结束但未生成完成，最后状态 {last_status}")
 
 
 def download(url, out_dir, task_id, index, *, fetch=None):
     fetch = fetch or _http_get_bytes
     os.makedirs(out_dir, exist_ok=True)
-    filename = f"draw-{task_id}-{index}.png"
+    ext = os.path.splitext(urllib.parse.urlparse(url).path)[1] or ".png"
+    filename = f"draw-{task_id}-{index}{ext}"
     path = os.path.abspath(os.path.join(out_dir, filename))
     with open(path, "wb") as f:
         f.write(fetch(url))
     return path
 
 
-def _http_post(url, api_key, body):
+def _http_post_stream(url, api_key, body, *, timeout=_STREAM_TIMEOUT):
+    """真实流式 POST：逐行 yield 解码后的文本。"""
     data = json.dumps(body).encode("utf-8")
     req = urllib.request.Request(
         url,
@@ -75,13 +81,15 @@ def _http_post(url, api_key, body):
         },
     )
     try:
-        with urllib.request.urlopen(req) as resp:
-            return json.loads(resp.read().decode("utf-8"))
+        resp = urllib.request.urlopen(req, timeout=timeout)
     except urllib.error.HTTPError as e:
         detail = e.read().decode("utf-8", "replace")[:200]
         raise DrawError(f"HTTP {e.code}: {detail}")
     except urllib.error.URLError as e:
         raise DrawError(f"网络错误: {e.reason}")
+    with resp:
+        for raw in resp:
+            yield raw.decode("utf-8", "replace")
 
 
 def _http_get_bytes(url):
@@ -97,7 +105,7 @@ def _http_get_bytes(url):
 def main(argv=None):
     parser = argparse.ArgumentParser(
         prog="draw",
-        description="提交生图任务、轮询等待并下载结果。",
+        description="发起生图、读进度并下载结果。",
     )
     parser.add_argument("prompt", help="生图提示词")
     parser.add_argument("--model", default=None,
@@ -107,8 +115,8 @@ def main(argv=None):
                         help="参考图公网 URL，可重复传多张")
     parser.add_argument("--out", default=".", help="图片保存目录，默认当前目录")
     parser.add_argument("--url-only", action="store_true", help="只打印图片 URL，不下载")
-    parser.add_argument("--interval", type=float, default=3.0, help="轮询间隔秒，默认 3")
-    parser.add_argument("--timeout", type=float, default=300.0, help="超时秒，默认 300")
+    parser.add_argument("--timeout", type=float, default=_STREAM_TIMEOUT,
+                        help=f"流读取超时秒，默认 {_STREAM_TIMEOUT}")
     args = parser.parse_args(argv)
 
     api_key = os.environ.get("IMAGE_API_KEY")
@@ -119,13 +127,16 @@ def main(argv=None):
         return 2
 
     model = args.model or os.environ.get("IMAGE_MODEL") or "gpt-image-2"
+
+    def open_stream(url, key, body):
+        return _http_post_stream(url, key, body, timeout=args.timeout)
+
     try:
-        task_id = submit(args.prompt, base=base, api_key=api_key, model=model,
-                         aspect=args.aspect, refs=args.refs, post=_http_post)
-        print(f"已提交，任务 id={task_id}，开始轮询…", file=sys.stderr)
-        urls = poll(task_id, base=base, api_key=api_key, interval=args.interval,
-                    timeout=args.timeout, post=_http_post,
-                    log=lambda m: print(m, file=sys.stderr))
+        print(f"生成中（模型 {model}）…", file=sys.stderr)
+        task_id, urls = generate(args.prompt, base=base, api_key=api_key, model=model,
+                                 aspect=args.aspect, refs=args.refs,
+                                 open_stream=open_stream,
+                                 log=lambda m: print(m, file=sys.stderr))
         if args.url_only:
             for u in urls:
                 print(u)
