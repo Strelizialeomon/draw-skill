@@ -92,3 +92,50 @@ def _http_get_bytes(url):
         raise DrawError(f"下载失败 HTTP {e.code}: {url}")
     except urllib.error.URLError as e:
         raise DrawError(f"下载失败 {e.reason}: {url}")
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        prog="draw",
+        description="提交生图任务、轮询等待并下载结果。",
+    )
+    parser.add_argument("prompt", help="生图提示词")
+    parser.add_argument("--model", default="gpt-image-2", help="模型名，默认 gpt-image-2")
+    parser.add_argument("--aspect", default="1024x1024", help="尺寸，默认 1024x1024")
+    parser.add_argument("--ref", action="append", default=[], dest="refs",
+                        help="参考图公网 URL，可重复传多张")
+    parser.add_argument("--out", default=".", help="图片保存目录，默认当前目录")
+    parser.add_argument("--url-only", action="store_true", help="只打印图片 URL，不下载")
+    parser.add_argument("--interval", type=float, default=3.0, help="轮询间隔秒，默认 3")
+    parser.add_argument("--timeout", type=float, default=300.0, help="超时秒，默认 300")
+    args = parser.parse_args(argv)
+
+    api_key = os.environ.get("IMAGE_API_KEY")
+    base = os.environ.get("IMAGE_API_BASE")
+    missing = [n for n, v in (("IMAGE_API_KEY", api_key), ("IMAGE_API_BASE", base)) if not v]
+    if missing:
+        print(f"错误: 缺少环境变量 {', '.join(missing)}，请先 export 后再运行。", file=sys.stderr)
+        return 2
+
+    try:
+        task_id = submit(args.prompt, base=base, api_key=api_key, model=args.model,
+                         aspect=args.aspect, refs=args.refs, post=_http_post)
+        print(f"已提交，任务 id={task_id}，开始轮询…", file=sys.stderr)
+        urls = poll(task_id, base=base, api_key=api_key, interval=args.interval,
+                    timeout=args.timeout, post=_http_post,
+                    log=lambda m: print(m, file=sys.stderr))
+        if args.url_only:
+            for u in urls:
+                print(u)
+            return 0
+        for i, u in enumerate(urls, 1):
+            path = download(u, args.out, task_id, i, fetch=_http_get_bytes)
+            print(path)
+        return 0
+    except DrawError as e:
+        print(f"错误: {e}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -225,5 +225,62 @@ class TestHttpPost(unittest.TestCase):
         self.assertIn("401", str(ctx.exception))
 
 
+class TestMain(unittest.TestCase):
+    def test_missing_env_returns_2(self):
+        import os
+        orig = dict(os.environ)
+        os.environ.pop("IMAGE_API_KEY", None)
+        os.environ.pop("IMAGE_API_BASE", None)
+        try:
+            rc = draw.main(["a cat"])
+        finally:
+            os.environ.clear()
+            os.environ.update(orig)
+        self.assertEqual(rc, 2)
+
+    def test_happy_path_prints_paths_and_returns_0(self):
+        import contextlib
+        import io
+        import os
+        orig = dict(os.environ)
+        os.environ["IMAGE_API_KEY"] = "sk"
+        os.environ["IMAGE_API_BASE"] = "https://api.example.com"
+        orig_submit, orig_poll, orig_download = draw.submit, draw.poll, draw.download
+        draw.submit = lambda prompt, **kw: "task-9"
+        draw.poll = lambda task_id, **kw: ["https://img/a.png"]
+        draw.download = lambda url, out, tid, idx, **kw: f"/abs/draw-{tid}-{idx}.png"
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                rc = draw.main(["a cat", "--out", "."])
+        finally:
+            draw.submit, draw.poll, draw.download = orig_submit, orig_poll, orig_download
+            os.environ.clear()
+            os.environ.update(orig)
+        self.assertEqual(rc, 0)
+        self.assertIn("/abs/draw-task-9-1.png", buf.getvalue())
+
+    def test_url_only_prints_urls(self):
+        import contextlib
+        import io
+        import os
+        orig = dict(os.environ)
+        os.environ["IMAGE_API_KEY"] = "sk"
+        os.environ["IMAGE_API_BASE"] = "https://api.example.com"
+        orig_submit, orig_poll = draw.submit, draw.poll
+        draw.submit = lambda prompt, **kw: "t"
+        draw.poll = lambda task_id, **kw: ["https://img/x.png"]
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                rc = draw.main(["a cat", "--url-only"])
+        finally:
+            draw.submit, draw.poll = orig_submit, orig_poll
+            os.environ.clear()
+            os.environ.update(orig)
+        self.assertEqual(rc, 0)
+        self.assertIn("https://img/x.png", buf.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()
