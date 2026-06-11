@@ -20,7 +20,8 @@ python3 draw.py "一只戴墨镜的柴犬" --out ./out
 
 成功后 stdout 打印图片本地绝对路径，stderr 打印进度。常用参数：
 
-- `--model`（默认 `gpt-image-2`）、`--aspect`（默认 `1024x1024`）
+- `--model`：模型名。优先级 `--model` > 环境变量 `IMAGE_MODEL` > `gpt-image-2`
+- `--aspect`（默认 `1024x1024`）
 - `--ref <公网图URL>`：参考图/垫图，可重复多张（本地图暂不支持）
 - `--out <目录>`：保存目录，默认当前目录
 - `--url-only`：只打印图片 URL、不下载

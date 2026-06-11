@@ -100,7 +100,8 @@ def main(argv=None):
         description="提交生图任务、轮询等待并下载结果。",
     )
     parser.add_argument("prompt", help="生图提示词")
-    parser.add_argument("--model", default="gpt-image-2", help="模型名，默认 gpt-image-2")
+    parser.add_argument("--model", default=None,
+                        help="模型名；不传则用 IMAGE_MODEL 环境变量，仍无则 gpt-image-2")
     parser.add_argument("--aspect", default="1024x1024", help="尺寸，默认 1024x1024")
     parser.add_argument("--ref", action="append", default=[], dest="refs",
                         help="参考图公网 URL，可重复传多张")
@@ -117,8 +118,9 @@ def main(argv=None):
         print(f"错误: 缺少环境变量 {', '.join(missing)}，请先 export 后再运行。", file=sys.stderr)
         return 2
 
+    model = args.model or os.environ.get("IMAGE_MODEL") or "gpt-image-2"
     try:
-        task_id = submit(args.prompt, base=base, api_key=api_key, model=args.model,
+        task_id = submit(args.prompt, base=base, api_key=api_key, model=model,
                          aspect=args.aspect, refs=args.refs, post=_http_post)
         print(f"已提交，任务 id={task_id}，开始轮询…", file=sys.stderr)
         urls = poll(task_id, base=base, api_key=api_key, interval=args.interval,

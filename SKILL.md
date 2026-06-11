@@ -11,6 +11,7 @@ description: 调用异步生图接口生成图片。当用户说"画/生成/帮�
 
 - `IMAGE_API_KEY`：接口的 Bearer token
 - `IMAGE_API_BASE`：接口域名，如 `https://api.example.com`（不带路径）
+- `IMAGE_MODEL`（可选）：默认模型名；不设则用 `gpt-image-2`
 
 若未配置，脚本会报错退出码 2。这时提醒用户先 export，例如：
 
@@ -27,6 +28,7 @@ python3 <技能目录>/draw.py "<提示词>" [--model gpt-image-2] [--aspect 102
 ```
 
 - 默认把图下载到当前目录，文件名 `draw-<任务id>-<序号>.png`，stdout 打印绝对路径。
+- `--model` 选模型：不传则用环境变量 `IMAGE_MODEL`，仍无则 `gpt-image-2`。用户用大白话点名某模型时，把它当 `--model` 传进去。
 - `--ref` 传公网图片 URL 做参考图（垫图），可重复多张；本地图片暂不支持。
 - `--url-only` 只打印图片 URL、不下载。
 - `--interval` / `--timeout` 调整轮询间隔（默认 3 秒）与超时（默认 300 秒）。

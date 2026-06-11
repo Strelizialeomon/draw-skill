@@ -282,5 +282,48 @@ class TestMain(unittest.TestCase):
         self.assertIn("https://img/x.png", buf.getvalue())
 
 
+class TestModelSelection(unittest.TestCase):
+    def _captured_model(self, argv, env):
+        import contextlib
+        import io
+        import os
+        orig = dict(os.environ)
+        os.environ["IMAGE_API_KEY"] = "sk"
+        os.environ["IMAGE_API_BASE"] = "https://api.example.com"
+        os.environ.pop("IMAGE_MODEL", None)
+        for k, v in env.items():
+            os.environ[k] = v
+        captured = {}
+
+        def fake_submit(prompt, **kw):
+            captured["model"] = kw.get("model")
+            return "t"
+
+        orig_submit, orig_poll, orig_download = draw.submit, draw.poll, draw.download
+        draw.submit = fake_submit
+        draw.poll = lambda task_id, **kw: ["https://img/a.png"]
+        draw.download = lambda url, out, tid, idx, **kw: "/abs/x.png"
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                draw.main(argv)
+        finally:
+            draw.submit, draw.poll, draw.download = orig_submit, orig_poll, orig_download
+            os.environ.clear()
+            os.environ.update(orig)
+        return captured["model"]
+
+    def test_defaults_to_gpt_image_2(self):
+        self.assertEqual(self._captured_model(["a cat"], {}), "gpt-image-2")
+
+    def test_env_var_is_used_when_no_flag(self):
+        self.assertEqual(self._captured_model(["a cat"], {"IMAGE_MODEL": "seedream"}), "seedream")
+
+    def test_flag_overrides_env_var(self):
+        self.assertEqual(
+            self._captured_model(["a cat", "--model", "flux"], {"IMAGE_MODEL": "seedream"}),
+            "flux",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
