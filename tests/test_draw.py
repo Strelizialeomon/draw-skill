@@ -1,3 +1,4 @@
+import json
 import unittest
 import draw
 
@@ -164,6 +165,64 @@ class TestDownload(unittest.TestCase):
             path = draw.download("https://img/a.png", nested, "t", 2, fetch=lambda u: b"x")
             self.assertTrue(os.path.exists(path))
             self.assertEqual(os.path.basename(path), "draw-t-2.png")
+
+
+class _FakeResp:
+    def __init__(self, payload):
+        self._payload = payload
+
+    def read(self):
+        return self._payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+class TestHttpPost(unittest.TestCase):
+    def test_sends_json_with_bearer_and_parses_response(self):
+        captured = {}
+
+        def fake_urlopen(req):
+            captured["url"] = req.full_url
+            captured["method"] = req.get_method()
+            captured["auth"] = req.get_header("Authorization")
+            captured["ctype"] = req.get_header("Content-type")
+            captured["data"] = req.data
+            return _FakeResp(b'{"code":0,"data":{"id":"abc"}}')
+
+        orig = draw.urllib.request.urlopen
+        draw.urllib.request.urlopen = fake_urlopen
+        try:
+            out = draw._http_post("https://api.example.com/v1/draw/completions",
+                                  "sk-key", {"prompt": "x"})
+        finally:
+            draw.urllib.request.urlopen = orig
+
+        self.assertEqual(out, {"code": 0, "data": {"id": "abc"}})
+        self.assertEqual(captured["method"], "POST")
+        self.assertEqual(captured["auth"], "Bearer sk-key")
+        self.assertEqual(captured["ctype"], "application/json")
+        self.assertEqual(json.loads(captured["data"].decode()), {"prompt": "x"})
+
+    def test_maps_httperror_to_drawerror(self):
+        import io
+        import urllib.error
+
+        def fake_urlopen(req):
+            raise urllib.error.HTTPError(req.full_url, 401, "Unauthorized", {},
+                                         io.BytesIO(b"no access"))
+
+        orig = draw.urllib.request.urlopen
+        draw.urllib.request.urlopen = fake_urlopen
+        try:
+            with self.assertRaises(draw.DrawError) as ctx:
+                draw._http_post("https://api.example.com/x", "k", {})
+        finally:
+            draw.urllib.request.urlopen = orig
+        self.assertIn("401", str(ctx.exception))
 
 
 if __name__ == "__main__":

@@ -61,3 +61,34 @@ def download(url, out_dir, task_id, index, *, fetch=None):
     with open(path, "wb") as f:
         f.write(fetch(url))
     return path
+
+
+def _http_post(url, api_key, body):
+    data = json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", "replace")[:200]
+        raise DrawError(f"HTTP {e.code}: {detail}")
+    except urllib.error.URLError as e:
+        raise DrawError(f"网络错误: {e.reason}")
+
+
+def _http_get_bytes(url):
+    try:
+        with urllib.request.urlopen(url) as resp:
+            return resp.read()
+    except urllib.error.HTTPError as e:
+        raise DrawError(f"下载失败 HTTP {e.code}: {url}")
+    except urllib.error.URLError as e:
+        raise DrawError(f"下载失败 {e.reason}: {url}")
