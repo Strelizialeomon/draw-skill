@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""透明通道体检：判 AI 出图的"透明底"是真的还是假的。需要 Pillow（draw.py 依旧零依赖）。
+"""透明通道体检：判 AI 出图的"透明底"是真的还是假的，并说清假在哪。需要 Pillow（draw.py 依旧零依赖）。
 
-判定（沿用 2026-10-05 出素材时实测的探针）：四角各取 20×20 区域的 alpha 均值，
-与底部中间（高 70% 以下、宽 30%~70%）区域的 alpha 均值——
-两者都 < 10 → 「真透明」；否则「不是真透明」（没通道 / 白底 / 棋盘格画进图里，都归这档）。
+判法（2026-10-06 修订二；合成图 8 类实测过）：看**边框一圈**里「全透明」像素的占比——
+≥ 25% 判「真透明」；1%~25% 判「存疑」；< 1%（或压根没有透明通道）判「不是真透明」，并给出原因与底色判断。
+（旧版「四角 + 下半留白区」探针只适合主体偏上的素材，居中、贴底的真透明图会被误判，已换掉。）
 
 用法：
   python3 alpha_check.py <图片> [<图片>...] [--bg RRGGBB]
@@ -14,24 +14,78 @@ import sys
 from pathlib import Path
 
 try:
-    from PIL import Image, ImageStat
+    from PIL import Image, ImageChops, ImageDraw, ImageStat
     HAS_PIL = True
 except ImportError:  # 允许 draw.py 在没装 Pillow 的机器上安全 import 本模块
     HAS_PIL = False
 
-CORNER = 20            # 四角探针边长（像素）
-ALPHA_THRESHOLD = 10   # alpha 均值低于它算「透」（沿用 gen_image.py 实测值）
+ALPHA_TRANSPARENT_MAX = 5      # alpha ≤ 5 算「全透明」
+ALPHA_OPAQUE_MIN = 250         # alpha ≥ 250 算「不透明」（上游透明图的实心区只到 252~254）
+TRUE_TRANSPARENT_RATIO = 25.0  # 边框全透明占比 ≥ 25% 判真透明
+SUSPECT_RATIO = 1.0            # 1%~25% 判存疑；< 1% 判不是
+QUANTIZE_STEP = 16             # 底色统计前的量化步长（每通道 //16*16）
+LIGHT_CHANNEL_MIN = 176        # 「浅色」：各通道 ≥ 176
+LIGHT_SPREAD_MAX = 16          # 「浅灰」：通道间差 ≤ 16
+CHECKER_SECOND_MIN = 20.0      # 棋盘格：第二色占比 ≥ 20%
+CHECKER_SUM_MIN = 80.0         # 棋盘格：两色合计 ≥ 80%
+LIGHT_DOMINANT_MIN = 80.0      # 浅色底：最多那色 ≥ 80%
 
 
-def _region_mean(alpha, box):
-    """区域 alpha 均值；坐标裁到图范围内，空区域算 0。"""
-    x0, y0, x1, y1 = box
-    w, h = alpha.size
-    x0, y0 = max(0, x0), max(0, y0)
-    x1, y1 = min(w, x1), min(h, y1)
-    if x1 <= x0 or y1 <= y0:
-        return 0.0
-    return ImageStat.Stat(alpha.crop((x0, y0, x1, y1))).mean[0]
+def _border_width(w, h):
+    return max(4, round(min(w, h) * 0.02))
+
+
+def _border_mask(w, h):
+    """边框一圈的掩膜（L 模式，边框内 255）。"""
+    border = Image.new("L", (w, h), 0)
+    ImageDraw.Draw(border).rectangle((0, 0, w - 1, h - 1), outline=255, width=_border_width(w, h))
+    return border
+
+
+def _lut(pred):
+    """按条件预生成 256 项查找表（走 PIL 的 C 实现，别用逐像素 lambda）。"""
+    return [255 if pred(v) else 0 for v in range(256)]
+
+
+def _border_transparent_ratio(alpha, w, h):
+    """边框里「全透明」像素的占比（%）。"""
+    full_tr = alpha.point(_lut(lambda a: a <= ALPHA_TRANSPARENT_MAX))
+    border = _border_mask(w, h)
+    border_px = ImageStat.Stat(border).sum[0]
+    hit_px = ImageStat.Stat(ImageChops.multiply(border, full_tr)).sum[0]
+    return (hit_px / border_px * 100) if border_px else 0.0
+
+
+def _is_light(c):
+    return min(c) >= LIGHT_CHANNEL_MIN and (max(c) - min(c)) <= LIGHT_SPREAD_MAX
+
+
+def _border_base(im, alpha, w, h):
+    """只看边框里的不透明像素，判底色：疑似棋盘格 / 白或浅色底 / 其它底 / None（判不出）。"""
+    border = _border_mask(w, h)
+    opaque = alpha.point(_lut(lambda a: a >= ALPHA_OPAQUE_MIN))
+    mask = ImageChops.multiply(border, opaque)
+    total = ImageStat.Stat(mask).sum[0] / 255
+    if total == 0:
+        return None
+    lut = [v // QUANTIZE_STEP * QUANTIZE_STEP for v in range(256)]
+    quant = Image.merge("RGB", [band.point(lut) for band in im.convert("RGB").split()])
+    canvas = Image.new("RGB", (w, h), (1, 1, 1))  # 哨兵色（量化后不会出现 1）
+    canvas.paste(quant, mask=mask)
+    counts = canvas.getcolors(maxcolors=1 << 24) or []
+    top = sorted(((n, c) for n, c in counts if c != (1, 1, 1)), reverse=True)
+    if not top:
+        return None
+    top_n, top_c = top[0]
+    second_n, second_c = top[1] if len(top) > 1 else (0, (0, 0, 0))
+    p_top = top_n / total * 100
+    p_second = second_n / total * 100
+    if (top_c != second_c and _is_light(top_c) and _is_light(second_c)
+            and p_second >= CHECKER_SECOND_MIN and p_top + p_second >= CHECKER_SUM_MIN):
+        return "疑似棋盘格画进图里"
+    if _is_light(top_c) and p_top >= LIGHT_DOMINANT_MIN:
+        return "白或浅色底"
+    return "其它底"
 
 
 def analyze(path):
@@ -41,27 +95,29 @@ def analyze(path):
     path = Path(path)
     im = Image.open(path)
     w, h = im.size
+    has_channel = im.mode in ("RGBA", "LA", "PA") or "transparency" in im.info
     alpha = im.convert("RGBA").getchannel("A")
     hist = alpha.histogram()
     total = w * h
-    fully = hist[0] / total * 100
-    opaque = hist[255] / total * 100
-    semi = 100 - fully - opaque
-    corners = [
-        _region_mean(alpha, (0, 0, CORNER, CORNER)),
-        _region_mean(alpha, (w - CORNER, 0, w, CORNER)),
-        _region_mean(alpha, (0, h - CORNER, CORNER, h)),
-        _region_mean(alpha, (w - CORNER, h - CORNER, w, h)),
-    ]
-    bottom_mid = _region_mean(alpha, (int(w * 0.3), int(h * 0.7), int(w * 0.7), h))
-    verdict = ("真透明" if max(corners) < ALPHA_THRESHOLD and bottom_mid < ALPHA_THRESHOLD
-               else "不是真透明（没通道 / 白底 / 棋盘格画进图里，都归这档）")
-    return [
+    fully = sum(hist[:ALPHA_TRANSPARENT_MAX + 1]) / total * 100
+    opaque = sum(hist[ALPHA_OPAQUE_MIN:]) / total * 100
+    semi = 100.0 - fully - opaque
+    ratio = _border_transparent_ratio(alpha, w, h)
+    lines = [
         f"{path.name}: {w}x{h} mode={im.mode}",
         f"  全透明 {fully:.1f}% / 半透明 {semi:.1f}% / 不透明 {opaque:.1f}%",
-        f"  四角 alpha {[int(c) for c in corners]}，留白区（下中）alpha 均值 {bottom_mid:.0f}",
-        f"  结论：{verdict}",
+        f"  边框全透明占比 {ratio:.1f}%（带宽 {_border_width(w, h)}px）",
     ]
+    if has_channel and ratio >= TRUE_TRANSPARENT_RATIO:
+        verdict = "真透明"
+    elif has_channel and ratio >= SUSPECT_RATIO:
+        verdict = "存疑（主体贴边，或背景没抠干净，用 --bg 预览确认）"
+    else:
+        reason = "没有透明通道" if not has_channel else "有通道但边框不透明"
+        base = _border_base(im, alpha, w, h)
+        verdict = f"不是真透明（{reason}" + (f"；底色：{base}" if base else "") + "）"
+    lines.append(f"  结论：{verdict}")
+    return lines
 
 
 def preview(path, bg_hex):
