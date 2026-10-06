@@ -952,6 +952,48 @@ class TestUseAndRecords(unittest.TestCase):
             self.assertEqual(out.getvalue(), seen[0] + "\n")  # stdout 仍只有图片路径
             self.assertEqual([p for p in os.listdir(out_dir) if p.endswith(".json")], [])
 
+    def test_list_models_with_invalid_use_returns_2(self):
+        with clean_env():
+            err = io.StringIO()
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+                rc = draw.main(["--list-models", "--use", "bogus"])
+        self.assertEqual(rc, 2)
+        self.assertIn("full", err.getvalue())
+
+    def test_seconds_count_retries_from_first_request(self):
+        with tempfile.TemporaryDirectory() as d:
+            out_dir = os.path.join(d, "out")
+            os.makedirs(out_dir)
+            calls = {"n": 0}
+            seen = []
+
+            def fake_generate(prompt, **kw):
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    raise draw.DrawError("生成失败: error", reason="error")
+                return ("t-1", ["https://img/a.png"])
+
+            def fake_download(url, out, tid, idx, **kw):
+                p = os.path.join(out, f"draw-{tid}-{idx}.png")
+                Path(p).write_bytes(b"img")
+                seen.append(p)
+                return p
+
+            values = iter([100.0, 130.0, 130.0, 130.0])  # 起跑 100，写记录时 130
+            orig_gen, orig_dl, orig_time = draw.generate, draw.download, draw.time
+            draw.generate = fake_generate
+            draw.download = fake_download
+            draw.time = types.SimpleNamespace(monotonic=lambda: next(values))
+            try:
+                with clean_env(IMAGE_API_KEY="sk-test-key"):
+                    with contextlib.redirect_stdout(io.StringIO()), \
+                            contextlib.redirect_stderr(io.StringIO()):
+                        rc = draw.main(["a cat", "--out", out_dir])
+            finally:
+                draw.generate, draw.download, draw.time = orig_gen, orig_dl, orig_time
+            self.assertEqual((rc, calls["n"]), (0, 2))  # 重试过一次
+            self.assertEqual(self._record(seen)["seconds"], 30)  # 含失败那次
+
     def test_use_does_not_change_request_body(self):
         bodies = []
 

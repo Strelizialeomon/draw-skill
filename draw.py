@@ -436,13 +436,13 @@ def main(argv=None):
                         help=f"流读取超时秒，默认 {_STREAM_TIMEOUT}")
     args = parser.parse_args(argv)
 
-    if args.list_models:
-        print(format_models())
-        return 0
-
     if args.use is not None and args.use not in USE_VALUES:
         print(f"错误: --use 只收 {' / '.join(USE_VALUES)}（收到「{args.use}」）", file=sys.stderr)
         return 2
+
+    if args.list_models:
+        print(format_models())
+        return 0
 
     if not args.prompt:
         print("错误: 缺少提示词（只想看模型目录用 --list-models）", file=sys.stderr)
@@ -465,11 +465,11 @@ def main(argv=None):
         return _http_post_stream(url, k, body, timeout=args.timeout)
 
     attempt = 0
+    started = time.monotonic()  # 记录里的 seconds 从第一次发起请求起算（含重试等待）
     while True:
         attempt += 1
         try:
             print(f"生成中（模型 {model}）…", file=sys.stderr)
-            started = time.monotonic()
             task_id, urls = generate(args.prompt, base=base, api_key=key, model=model,
                                      aspect=args.aspect, refs=refs, mask=mask,
                                      quality=args.quality, background=args.background,

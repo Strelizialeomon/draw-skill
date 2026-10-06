@@ -43,7 +43,7 @@ description: 调用生图接口（grsai / GPT Image，流式）生成图片。�
 
 ### ③ 写提示词
 
-按落地场景写：用途、布局留位、色值对齐页面、用途约束写死、写明不要什么——六条要点与 jasmine 实例见 `references/prompting.md`。
+按落地场景写：用途、布局留位、色值对齐页面、用途约束写死、写明不要什么、风格要否掉时用用户原话改方向——六条要点与 jasmine 实例见 `references/prompting.md`。
 
 ### ④ 调用
 

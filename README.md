@@ -31,6 +31,8 @@ python3 alpha_check.py ./out/draw-xxx-1.png --bg 1b1d3c
 - `--mask <公网URL 或 本地PNG>`：遮罩（局部重绘），必须配 `--ref`；透明区 = 要重绘的区域，尺寸与第一张参考图一致；白底黑形遮罩无效
 - `--model`：优先级 `--model` > `IMAGE_MODEL` > `gpt-image-2`；**不限于内置目录**，任何模型名直接传
 - `--aspect`：默认 `1024x1024`；不合模型尺寸规则时 stderr 警告、照发（1K 档模型用 13 档预设/比例，1K~4K 档只收像素值）
+- `--use`：出图用途（`full` / `cutout` / `sheet` / `alpha`，见 SKILL.md「① 判用途」）；只写进同名 `.json` 记录，不改变任何出图行为
+- 出图后每张图旁边会写一份同名 `.json` 记录（提示词 / 模型 / 尺寸 / 参数 / 用途 / 任务 id / 时间）；写失败只警告，不影响出图
 - `--quality` / `--background`：透传给接口；不传就不发这两个字段
 - `--inspect`：出图后跑透明体检（报告走 stderr）
 - `--out`、`--url-only`（链接 2 小时后失效）、`--timeout`：同旧版
