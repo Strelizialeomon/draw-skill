@@ -1,12 +1,48 @@
+import base64
 import contextlib
 import io
 import json
 import os
+import sys
 import tempfile
+import types
 import unittest
 import urllib.error
+from pathlib import Path
+from unittest import mock
 
 import draw
+
+
+# ---------------------------------------------------------------------------
+# 测试辅助
+# ---------------------------------------------------------------------------
+_ENV_KEYS = ("IMAGE_API_KEY", "GRSAI_KEY", "IMAGE_API_BASE", "IMAGE_MODEL")
+
+
+@contextlib.contextmanager
+def clean_env(**overrides):
+    """先清掉四个相关环境变量再跑，退出时还原。"""
+    orig = dict(os.environ)
+    for k in _ENV_KEYS:
+        os.environ.pop(k, None)
+    os.environ.update(overrides)
+    try:
+        yield
+    finally:
+        os.environ.clear()
+        os.environ.update(orig)
+
+
+@contextlib.contextmanager
+def key_file(path):
+    """把 draw.KEY_FILE 指到别处，退出时还原。"""
+    orig = draw.KEY_FILE
+    draw.KEY_FILE = Path(path)
+    try:
+        yield
+    finally:
+        draw.KEY_FILE = orig
 
 
 # ---------------------------------------------------------------------------
@@ -24,6 +60,105 @@ class TestParseSseEvent(unittest.TestCase):
 
     def test_empty_payload_returns_none(self):
         self.assertIsNone(draw._parse_sse_event("data: "))
+
+
+# ---------------------------------------------------------------------------
+# resolve_key / resolve_base
+# ---------------------------------------------------------------------------
+class TestResolveKey(unittest.TestCase):
+    def test_env_image_api_key_wins(self):
+        with tempfile.TemporaryDirectory() as d:
+            f = Path(d) / "key"
+            f.write_text("sk-from-file")
+            with clean_env(IMAGE_API_KEY="sk-from-env"), key_file(f):
+                self.assertEqual(draw.resolve_key(), "sk-from-env")
+
+    def test_gr_sai_key_is_second(self):
+        with tempfile.TemporaryDirectory() as d:
+            f = Path(d) / "key"
+            f.write_text("sk-from-file")
+            with clean_env(GRSAI_KEY="sk-grsai"), key_file(f):
+                self.assertEqual(draw.resolve_key(), "sk-grsai")
+
+    def test_file_fallback_strips_whitespace(self):
+        with tempfile.TemporaryDirectory() as d:
+            f = Path(d) / "key"
+            f.write_text("  sk-from-file\n")
+            with clean_env(), key_file(f):
+                self.assertEqual(draw.resolve_key(), "sk-from-file")
+
+    def test_all_missing_raises_usage_error(self):
+        with tempfile.TemporaryDirectory() as d:
+            with clean_env(), key_file(Path(d) / "nope"):
+                with self.assertRaises(draw.UsageError):
+                    draw.resolve_key()
+
+
+class TestResolveBase(unittest.TestCase):
+    def test_env_overrides_default(self):
+        with clean_env(IMAGE_API_BASE="https://x.example.com"):
+            self.assertEqual(draw.resolve_base(), "https://x.example.com")
+
+    def test_default_is_grsai_host(self):
+        with clean_env():
+            self.assertEqual(draw.resolve_base(), draw.DEFAULT_BASE)
+        self.assertEqual(draw.DEFAULT_BASE, "https://grsai.dakka.com.cn")
+
+
+# ---------------------------------------------------------------------------
+# normalize_refs
+# ---------------------------------------------------------------------------
+class TestNormalizeRefs(unittest.TestCase):
+    def test_urls_pass_through(self):
+        refs = ["http://a/1.png", "https://b/2.jpg", "data:image/png;base64,AAA"]
+        self.assertEqual(draw.normalize_refs(refs), refs)
+
+    def test_local_file_becomes_data_url(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "ref.png"
+            p.write_bytes(b"\x89PNG123")
+            out = draw.normalize_refs([str(p)])
+            self.assertEqual(len(out), 1)
+            self.assertTrue(out[0].startswith("data:image/png;base64,"))
+            self.assertEqual(base64.b64decode(out[0].split(",", 1)[1]), b"\x89PNG123")
+
+    def test_mime_by_extension_with_png_fallback(self):
+        with tempfile.TemporaryDirectory() as d:
+            j = Path(d) / "a.jpg"
+            j.write_bytes(b"jpg-bytes")
+            weird = Path(d) / "b.xyz"
+            weird.write_bytes(b"weird")
+            out = draw.normalize_refs([str(j), str(weird)])
+            self.assertTrue(out[0].startswith("data:image/jpeg;base64,"))
+            self.assertTrue(out[1].startswith("data:image/png;base64,"))
+
+    def test_missing_file_raises_usage_error(self):
+        with self.assertRaises(draw.UsageError) as ctx:
+            draw.normalize_refs(["/no/such/file.png"])
+        self.assertIn("/no/such/file.png", str(ctx.exception))
+
+
+# ---------------------------------------------------------------------------
+# build_body
+# ---------------------------------------------------------------------------
+class TestBuildBody(unittest.TestCase):
+    def test_defaults_omit_optional_fields(self):
+        body = draw.build_body(model="m", prompt="p", aspect="1024x1024", refs=[])
+        self.assertEqual(body, {"model": "m", "prompt": "p", "aspectRatio": "1024x1024",
+                                "shutProgress": False})
+
+    def test_refs_quality_background_included(self):
+        body = draw.build_body(model="m", prompt="p", aspect="a", refs=["data:x"],
+                               quality="medium", background="transparent")
+        self.assertEqual(body["urls"], ["data:x"])
+        self.assertEqual(body["quality"], "medium")
+        self.assertEqual(body["background"], "transparent")
+
+    def test_empty_strings_omitted(self):
+        body = draw.build_body(model="m", prompt="p", aspect="a", refs=[],
+                               quality="", background="")
+        self.assertNotIn("quality", body)
+        self.assertNotIn("background", body)
 
 
 # ---------------------------------------------------------------------------
@@ -73,6 +208,19 @@ class TestGenerate(unittest.TestCase):
                       model="m", aspect="1024x1024", refs=["https://img/1.png"],
                       open_stream=fake_stream, log=lambda m: None)
         self.assertEqual(captured["body"]["urls"], ["https://img/1.png"])
+
+    def test_passes_quality_and_background(self):
+        captured = {}
+
+        def fake_stream(url, api_key, body):
+            captured["body"] = body
+            yield 'data: {"id":"x","status":"succeeded","results":[{"url":"u"}]}'
+
+        draw.generate("a cat", base="b", api_key="k", model="m", aspect="a", refs=[],
+                      quality="medium", background="transparent",
+                      open_stream=fake_stream, log=lambda m: None)
+        self.assertEqual(captured["body"]["quality"], "medium")
+        self.assertEqual(captured["body"]["background"], "transparent")
 
     def test_raises_on_failed(self):
         def fake_stream(url, api_key, body):
@@ -186,18 +334,85 @@ class TestHttpPostStream(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# _inspect_files
+# ---------------------------------------------------------------------------
+class TestInspectFiles(unittest.TestCase):
+    def test_module_missing_skips(self):
+        err = io.StringIO()
+        with mock.patch.dict(sys.modules, {"alpha_check": None}):
+            with contextlib.redirect_stderr(err):
+                draw._inspect_files(["/tmp/x.png"])
+        self.assertIn("体检跳过", err.getvalue())
+
+    def test_pillow_missing_skips(self):
+        fake = types.ModuleType("alpha_check")
+        fake.HAS_PIL = False
+        err = io.StringIO()
+        with mock.patch.dict(sys.modules, {"alpha_check": fake}):
+            with contextlib.redirect_stderr(err):
+                draw._inspect_files(["/tmp/x.png"])
+        self.assertIn("体检跳过", err.getvalue())
+        self.assertIn("Pillow", err.getvalue())
+
+    def test_reports_lines_to_stderr(self):
+        fake = types.ModuleType("alpha_check")
+        fake.HAS_PIL = True
+        fake.analyze = lambda p: [f"{p}: 40x40", "  结论：真透明"]
+        err = io.StringIO()
+        with mock.patch.dict(sys.modules, {"alpha_check": fake}):
+            with contextlib.redirect_stderr(err):
+                draw._inspect_files(["/tmp/x.png"])
+        self.assertIn("结论：真透明", err.getvalue())
+
+
+# ---------------------------------------------------------------------------
+# --list-models
+# ---------------------------------------------------------------------------
+class TestListModels(unittest.TestCase):
+    def test_prints_catalog_offline_without_key(self):
+        calls = []
+
+        def fake_urlopen(*a, **k):
+            calls.append(a)
+            raise AssertionError("--list-models 不该触网")
+
+        orig = draw.urllib.request.urlopen
+        draw.urllib.request.urlopen = fake_urlopen
+        buf = io.StringIO()
+        try:
+            with tempfile.TemporaryDirectory() as d, clean_env(), key_file(Path(d) / "nope"):
+                with contextlib.redirect_stdout(buf):
+                    rc = draw.main(["--list-models"])
+        finally:
+            draw.urllib.request.urlopen = orig
+
+        out = buf.getvalue()
+        self.assertEqual(rc, 0)
+        self.assertEqual(calls, [])
+        for name in ("gpt-image-2", "gpt-image-2-vip", "gpt-image-2.5",
+                     "gpt-image-2.5-flare", "gpt-image-2.5-sunburst"):
+            self.assertIn(name, out)
+        self.assertIn("维护中", out)
+        self.assertIn("快照 2026-10-06", out)
+        self.assertIn(draw.MODELS_PAGE, out)
+
+
+# ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
 class TestMain(unittest.TestCase):
-    def test_missing_env_returns_2(self):
-        orig = dict(os.environ)
-        os.environ.pop("IMAGE_API_KEY", None)
-        os.environ.pop("IMAGE_API_BASE", None)
-        try:
-            rc = draw.main(["a cat"])
-        finally:
-            os.environ.clear()
-            os.environ.update(orig)
+    def test_missing_key_returns_2(self):
+        err = io.StringIO()
+        with tempfile.TemporaryDirectory() as d, clean_env(), key_file(Path(d) / "nope"):
+            with contextlib.redirect_stderr(err):
+                rc = draw.main(["a cat"])
+        self.assertEqual(rc, 2)
+        self.assertIn("IMAGE_API_KEY", err.getvalue())
+
+    def test_missing_prompt_returns_2(self):
+        with clean_env():
+            with contextlib.redirect_stderr(io.StringIO()):
+                rc = draw.main([])
         self.assertEqual(rc, 2)
 
     def test_happy_path_prints_paths_and_returns_0(self):
@@ -234,6 +449,32 @@ class TestMain(unittest.TestCase):
             os.environ.update(orig)
         self.assertEqual(rc, 0)
         self.assertIn("https://img/x.png", buf.getvalue())
+
+
+class TestMainInspect(unittest.TestCase):
+    def _run_main(self, argv):
+        recorded = []
+        with tempfile.TemporaryDirectory() as d, clean_env(IMAGE_API_KEY="sk"):
+            orig_gen, orig_dl, orig_ins = draw.generate, draw.download, draw._inspect_files
+            draw.generate = lambda prompt, **kw: ("t1", ["https://img/a.png"])
+            draw.download = lambda url, out, tid, idx, **kw: "/abs/x1.png"
+            draw._inspect_files = lambda paths: recorded.append(paths)
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    rc = draw.main(argv)
+            finally:
+                draw.generate, draw.download, draw._inspect_files = orig_gen, orig_dl, orig_ins
+        return rc, recorded
+
+    def test_inspect_called_with_downloaded_paths(self):
+        rc, recorded = self._run_main(["a cat", "--inspect"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(recorded, [["/abs/x1.png"]])
+
+    def test_url_only_skips_inspect(self):
+        rc, recorded = self._run_main(["a cat", "--url-only", "--inspect"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(recorded, [])
 
 
 # ---------------------------------------------------------------------------
