@@ -4,6 +4,7 @@
 用法示例：
   python3 draw.py "一只戴墨镜的柴犬"
   python3 draw.py "把这只猫画成油画" --ref ./cat.png --inspect
+  python3 draw.py "三盏南瓜灯剪影" --use cutout
   python3 draw.py "只把中间那块改成蓝色" --ref ./p.png --mask ./m.png
   python3 draw.py --list-models
 
@@ -15,8 +16,12 @@
 护栏（都只帮你少犯错，不拦路）：本地图按文件头判格式（png / jpg / webp）；
 --aspect 不合模型尺寸规则只警告照发；failure_reason=error 自动重试 1 次（官方说失败退积分）。
 
+出图记录：每张下载的图旁边写一份同名 .json（提示词 / 模型 / 尺寸 / 参数 / 用途 / 任务 id / 时间）。
+--use 只写进记录、不改变任何出图行为；--url-only 不写；写失败只警告一行，出图照常。
+
 已知坑（2026-10-05 实测）：grsai 的 gpt-image-2-vip 渠道 background="transparent" 不生效。
-透明素材默认走「纯色平底出图 → 本地抠图」，或只在官方称支持透明的模型上试 + 用 alpha_check.py 体检。
+透明素材怎么出：先按 SKILL.md「判用途」归类；透明位图只在官方称支持透明的模型上试 + 用 alpha_check.py 体检，
+不成退回纯色平底 + 本地抠图。
 
 接口 /v1/draw/completions 是 SSE 流式：连接挂住，逐条推 `data: {事件}`，
 每个事件是扁平 JSON（含 status/progress/results），直到 succeeded 或 failed。
@@ -27,13 +32,16 @@ import json
 import os
 import re
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import datetime
 from pathlib import Path
 
 DEFAULT_BASE = "https://grsai.dakka.com.cn"
 DEFAULT_MODEL = "gpt-image-2"
+USE_VALUES = ("full", "cutout", "sheet", "alpha")  # --use 四个用途（只进记录，不影响行为）
 KEY_FILE = Path.home() / ".config" / "grsai" / "key"
 _STREAM_TIMEOUT = 300  # 流读取默认超时秒
 
@@ -317,6 +325,29 @@ def download(url, out_dir, task_id, index, *, fetch=None):
     return path
 
 
+def record_path(image_path):
+    """记录文件路径 = 图片文件名去扩展名 + .json，与图片同目录。"""
+    stem, _ = os.path.splitext(str(image_path))
+    return stem + ".json"
+
+
+def record_ref(ref):
+    """记录里怎么存参考图 / 遮罩：URL 原样；本地路径转绝对路径；data URL 不落 base64。"""
+    if ref.startswith(("http://", "https://")):
+        return ref
+    if ref.startswith("data:"):
+        return "<data-url>"
+    return os.path.abspath(ref)
+
+
+def write_record(image_path, record):
+    """在图片旁写同名 .json 记录（UTF-8、ensure_ascii=False、缩进 2）；写失败由调用方兜底。"""
+    path = record_path(image_path)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(record, f, ensure_ascii=False, indent=2)
+    return path
+
+
 def _http_post_stream(url, api_key, body, *, timeout=_STREAM_TIMEOUT):
     """真实流式 POST：逐行 yield 解码后的文本。"""
     data = json.dumps(body).encode("utf-8")
@@ -392,6 +423,8 @@ def main(argv=None):
                         help="质量档（随模型不同，如 medium）；不传则不发该字段")
     parser.add_argument("--background", default=None,
                         help="底色（如 transparent；空串=不发该字段）")
+    parser.add_argument("--use", default=None, metavar="full|cutout|sheet|alpha",
+                        help="出图用途（只写进同名 .json 记录，不影响请求与任何出图行为）")
     parser.add_argument("--inspect", action="store_true",
                         help="下载后对每张成图跑透明体检（报告走 stderr）")
     parser.add_argument("--list-models", action="store_true",
@@ -406,6 +439,10 @@ def main(argv=None):
     if args.list_models:
         print(format_models())
         return 0
+
+    if args.use is not None and args.use not in USE_VALUES:
+        print(f"错误: --use 只收 {' / '.join(USE_VALUES)}（收到「{args.use}」）", file=sys.stderr)
+        return 2
 
     if not args.prompt:
         print("错误: 缺少提示词（只想看模型目录用 --list-models）", file=sys.stderr)
@@ -432,6 +469,7 @@ def main(argv=None):
         attempt += 1
         try:
             print(f"生成中（模型 {model}）…", file=sys.stderr)
+            started = time.monotonic()
             task_id, urls = generate(args.prompt, base=base, api_key=key, model=model,
                                      aspect=args.aspect, refs=refs, mask=mask,
                                      quality=args.quality, background=args.background,
@@ -456,6 +494,27 @@ def main(argv=None):
         for i, u in enumerate(urls, 1):
             paths.append(download(u, args.out, task_id, i, fetch=_http_get_bytes))
             print(paths[-1])
+            record = {
+                "prompt": args.prompt,
+                "model": model,
+                "aspect": args.aspect,
+                "quality": args.quality or None,
+                "background": args.background or None,
+                "refs": [record_ref(r) for r in args.refs],
+                "mask": record_ref(args.mask) if args.mask else None,
+                "use": args.use,
+                "base": base,
+                "task_id": task_id,
+                "index": i,
+                "image_url": u,
+                "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+                "seconds": round(time.monotonic() - started),
+            }
+            try:
+                write_record(paths[-1], record)
+            except OSError as e:
+                print(f"警告: 出图记录写不了（不影响出图）：{record_path(paths[-1])}"
+                      f"（{e.strerror or e}）", file=sys.stderr)
         if args.inspect:
             _inspect_files(paths)
         return 0

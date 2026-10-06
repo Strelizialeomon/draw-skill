@@ -46,7 +46,7 @@ python3 alpha_check.py ./out/draw-xxx-1.png --bg 1b1d3c
 
 ## 已知坑
 
-- `background: transparent` 在本渠道不稳：官方只列 vip / flare / sunburst 支持，vip 实测不生效（2026-10-05：纯文字出图带它连续 3 次失败；带参考图时被忽略、返回白底），另两个在维护。透明素材默认走「纯色平底出图 → 本地抠图」。
+- `background: transparent` 在本渠道不稳：官方只列 vip / flare / sunburst 支持，vip 实测不生效（2026-10-05：纯文字出图带它连续 3 次失败；带参考图时被忽略、返回白底），另两个在维护。透明素材怎么出不默认一条路——先按 SKILL.md「① 判用途」归类（透明位图 / 抠形状）再定路线；纯色平底出图 + 本地抠图仍是多数情况下的落地路线。
 
 ## 测试
 
