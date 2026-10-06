@@ -67,6 +67,10 @@ class TestParseSseEvent(unittest.TestCase):
     def test_empty_payload_returns_none(self):
         self.assertIsNone(draw._parse_sse_event("data: "))
 
+    def test_non_json_payload_returns_none(self):
+        self.assertIsNone(draw._parse_sse_event("data: [DONE]"))
+        self.assertIsNone(draw._parse_sse_event("data: : keepalive"))
+
 
 # ---------------------------------------------------------------------------
 # resolve_key / resolve_base
@@ -96,6 +100,14 @@ class TestResolveKey(unittest.TestCase):
     def test_all_missing_raises_usage_error(self):
         with tempfile.TemporaryDirectory() as d:
             with clean_env(), key_file(Path(d) / "nope"):
+                with self.assertRaises(draw.UsageError):
+                    draw.resolve_key()
+
+    def test_unreadable_key_file_raises_usage_error(self):
+        with tempfile.TemporaryDirectory() as d:
+            adir = Path(d) / "keydir"          # KEY_FILE 是目录 → 读不了
+            adir.mkdir()
+            with clean_env(), key_file(adir):
                 with self.assertRaises(draw.UsageError):
                     draw.resolve_key()
 
@@ -157,6 +169,15 @@ class TestNormalizeRefs(unittest.TestCase):
         with self.assertRaises(draw.UsageError) as ctx:
             draw.normalize_refs(["/no/such/file.png"])
         self.assertIn("/no/such/file.png", str(ctx.exception))
+
+    def test_unreadable_file_raises_usage_error(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "ref.png"
+            p.write_bytes(_png_bytes(6))
+            with mock.patch.object(Path, "read_bytes",
+                                   side_effect=PermissionError(13, "Permission denied")):
+                with self.assertRaises(draw.UsageError):
+                    draw.normalize_refs([str(p)])
 
     def test_oversize_file_warns_but_passes(self):
         with tempfile.TemporaryDirectory() as d:
@@ -226,6 +247,15 @@ class TestNormalizeMask(unittest.TestCase):
     def test_missing_file(self):
         with self.assertRaises(draw.UsageError):
             draw.normalize_mask("/no/such.png", has_refs=True)
+
+    def test_unreadable_mask_raises_usage_error(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "m.png"
+            p.write_bytes(_png_bytes(6))
+            with mock.patch.object(Path, "read_bytes",
+                                   side_effect=PermissionError(13, "Permission denied")):
+                with self.assertRaises(draw.UsageError):
+                    draw.normalize_mask(str(p), has_refs=True)
 
 
 # ---------------------------------------------------------------------------
@@ -364,6 +394,15 @@ class TestGenerate(unittest.TestCase):
         self.assertEqual(captured["body"]["mask"], "data:image/png;base64,M")
         self.assertEqual(captured["body"]["quality"], "medium")
         self.assertEqual(captured["body"]["background"], "transparent")
+
+    def test_non_json_frames_are_skipped(self):
+        def fake_stream(url, api_key, body):
+            yield "data: [DONE]"
+            yield 'data: {"id":"t","status":"succeeded","results":[{"url":"u"}]}'
+
+        task_id, urls = draw.generate("x", base="b", api_key="k", model="m", aspect="a",
+                                      refs=[], open_stream=fake_stream, log=lambda m: None)
+        self.assertEqual(urls, ["u"])
 
     def test_failed_carries_reason_and_detail(self):
         def fake_stream(url, api_key, body):

@@ -108,7 +108,10 @@ def resolve_key():
     """key 回退链：IMAGE_API_KEY → GRSAI_KEY → ~/.config/grsai/key 文件。"""
     key = os.environ.get("IMAGE_API_KEY") or os.environ.get("GRSAI_KEY") or ""
     if not key and KEY_FILE.exists():
-        key = KEY_FILE.read_text().strip()
+        try:
+            key = KEY_FILE.read_text().strip()
+        except (OSError, UnicodeDecodeError):
+            raise UsageError(f"key 文件读不了（权限或编码问题）：{KEY_FILE}")
     if not key:
         raise UsageError(
             "没找到 key：设 IMAGE_API_KEY（或 GRSAI_KEY）环境变量，"
@@ -149,7 +152,10 @@ def normalize_refs(refs):
         p = Path(ref)
         if not p.is_file():
             raise UsageError(f"参考图不存在：{ref}")
-        data = p.read_bytes()
+        try:
+            data = p.read_bytes()
+        except OSError as e:
+            raise UsageError(f"参考图读不了：{ref}（{e.strerror or e}）")
         mime = _sniff_image(data)
         if mime is None:
             raise UsageError(f"参考图只支持 png / jpg / webp，先转换：{ref}")
@@ -173,7 +179,10 @@ def normalize_mask(mask, *, has_refs):
     p = Path(mask)
     if not p.is_file():
         raise UsageError(f"遮罩文件不存在：{mask}")
-    data = p.read_bytes()
+    try:
+        data = p.read_bytes()
+    except OSError as e:
+        raise UsageError(f"遮罩读不了：{mask}（{e.strerror or e}）")
     if _sniff_image(data) != "image/png":
         raise UsageError(f"遮罩只收 PNG（透明区 = 要重绘的区域）：{mask}")
     if not _png_has_alpha(data):
@@ -261,7 +270,10 @@ def _parse_sse_event(line):
     payload = line[len("data:"):].strip()
     if not payload:
         return None
-    return json.loads(payload)
+    try:
+        return json.loads(payload)
+    except json.JSONDecodeError:
+        return None  # 非 JSON 帧（心跳等）跳过，别打断整条流
 
 
 def generate(prompt, *, base, api_key, model, aspect, refs, mask=None, quality=None,
