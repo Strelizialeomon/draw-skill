@@ -31,6 +31,8 @@ python3 alpha_check.py ./out/draw-xxx-1.png --bg 1b1d3c
 - `--mask <公网URL 或 本地PNG>`：遮罩（局部重绘），必须配 `--ref`；透明区 = 要重绘的区域，尺寸与第一张参考图一致；白底黑形遮罩无效
 - `--model`：优先级 `--model` > `IMAGE_MODEL` > `gpt-image-2`；**不限于内置目录**，任何模型名直接传
 - `--aspect`：默认 `1024x1024`；不合模型尺寸规则时 stderr 警告、照发（1K 档模型用 13 档预设/比例，1K~4K 档只收像素值）
+- `--use`：出图用途（`full` / `cutout` / `sheet` / `alpha`，见 SKILL.md「① 判用途」）；只写进同名 `.json` 记录，不改变任何出图行为
+- 出图后每张图旁边会写一份同名 `.json` 记录（提示词 / 模型 / 尺寸 / 参数 / 用途 / 任务 id / 时间）；写失败只警告，不影响出图
 - `--quality` / `--background`：透传给接口；不传就不发这两个字段
 - `--inspect`：出图后跑透明体检（报告走 stderr）
 - `--out`、`--url-only`（链接 2 小时后失效）、`--timeout`：同旧版
@@ -46,7 +48,7 @@ python3 alpha_check.py ./out/draw-xxx-1.png --bg 1b1d3c
 
 ## 已知坑
 
-- `background: transparent` 在本渠道不稳：官方只列 vip / flare / sunburst 支持，vip 实测不生效（2026-10-05：纯文字出图带它连续 3 次失败；带参考图时被忽略、返回白底），另两个在维护。透明素材默认走「纯色平底出图 → 本地抠图」。
+- `background: transparent` 在本渠道不稳：官方只列 vip / flare / sunburst 支持，vip 实测不生效（2026-10-05：纯文字出图带它连续 3 次失败；带参考图时被忽略、返回白底），另两个在维护。透明素材怎么出不默认一条路——先按 SKILL.md「① 判用途」归类（透明位图 / 抠形状）再定路线；纯色平底出图 + 本地抠图仍是多数情况下的落地路线。
 
 ## 测试
 

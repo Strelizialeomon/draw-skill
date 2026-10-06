@@ -619,7 +619,7 @@ class TestMain(unittest.TestCase):
         draw.download = lambda url, out, tid, idx, **kw: f"/abs/draw-{tid}-{idx}.png"
         buf = io.StringIO()
         try:
-            with contextlib.redirect_stdout(buf):
+            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
                 rc = draw.main(["a cat", "--out", "."])
         finally:
             draw.generate, draw.download = orig_gen, orig_dl
@@ -636,7 +636,7 @@ class TestMain(unittest.TestCase):
         draw.generate = lambda prompt, **kw: ("t", ["https://img/x.png"])
         buf = io.StringIO()
         try:
-            with contextlib.redirect_stdout(buf):
+            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
                 rc = draw.main(["a cat", "--url-only"])
         finally:
             draw.generate = orig_gen
@@ -717,7 +717,8 @@ class TestMainMask(unittest.TestCase):
             draw.generate = fake_generate
             draw.download = lambda url, out, tid, idx, **kw: "/abs/x.png"
             try:
-                with contextlib.redirect_stdout(io.StringIO()):
+                with contextlib.redirect_stdout(io.StringIO()), \
+                        contextlib.redirect_stderr(io.StringIO()):
                     rc = draw.main(["a cat", "--ref", str(ref), "--mask", str(mask)])
             finally:
                 draw.generate, draw.download = orig_gen, orig_dl
@@ -735,7 +736,8 @@ class TestMainInspect(unittest.TestCase):
             draw.download = lambda url, out, tid, idx, **kw: "/abs/x1.png"
             draw._inspect_files = lambda paths: recorded.append(paths)
             try:
-                with contextlib.redirect_stdout(io.StringIO()):
+                with contextlib.redirect_stdout(io.StringIO()), \
+                        contextlib.redirect_stderr(io.StringIO()):
                     rc = draw.main(argv)
             finally:
                 draw.generate, draw.download, draw._inspect_files = orig_gen, orig_dl, orig_ins
@@ -773,7 +775,8 @@ class TestModelSelection(unittest.TestCase):
         draw.generate = fake_generate
         draw.download = lambda url, out, tid, idx, **kw: "/abs/x.png"
         try:
-            with contextlib.redirect_stdout(io.StringIO()):
+            with contextlib.redirect_stdout(io.StringIO()), \
+                    contextlib.redirect_stderr(io.StringIO()):
                 draw.main(argv)
         finally:
             draw.generate, draw.download = orig_gen, orig_dl
@@ -792,6 +795,229 @@ class TestModelSelection(unittest.TestCase):
             self._captured_model(["a cat", "--model", "flux"], {"IMAGE_MODEL": "seedream"}),
             "flux",
         )
+
+
+# ---------------------------------------------------------------------------
+# --use 与出图记录
+# ---------------------------------------------------------------------------
+class TestRecordHelpers(unittest.TestCase):
+    def test_record_path_swaps_extension(self):
+        self.assertEqual(draw.record_path("/o/draw-t-1.png"), "/o/draw-t-1.json")
+
+    def test_record_ref_keeps_urls(self):
+        self.assertEqual(draw.record_ref("https://x/a.png"), "https://x/a.png")
+
+    def test_record_ref_local_becomes_abspath(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "r.png")
+            self.assertEqual(draw.record_ref(p), os.path.abspath(p))
+
+    def test_record_ref_data_url_not_leaked(self):
+        self.assertEqual(draw.record_ref("data:image/png;base64,AAAA"), "<data-url>")
+
+
+class TestUseAndRecords(unittest.TestCase):
+    def _run(self, argv_extra, *, tmp, url="https://img/a.png"):
+        """桩掉 generate / download 跑 main；download 真写一张假图，好让记录有落脚处。"""
+        out_dir = os.path.join(tmp, "out")
+        os.makedirs(out_dir, exist_ok=True)
+        seen = []
+
+        def fake_download(url_, out, tid, idx, **kw):
+            p = os.path.join(out, f"draw-{tid}-{idx}.png")
+            Path(p).write_bytes(b"img")
+            seen.append(p)
+            return p
+
+        orig_gen, orig_dl = draw.generate, draw.download
+        draw.generate = lambda prompt, **kw: ("t-1", [url])
+        draw.download = fake_download
+        out, err = io.StringIO(), io.StringIO()
+        try:
+            with clean_env(IMAGE_API_KEY="sk-test-key"):
+                with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                    rc = draw.main(["a cat", "--out", out_dir, *argv_extra])
+        finally:
+            draw.generate, draw.download = orig_gen, orig_dl
+        return rc, out.getvalue(), err.getvalue(), seen
+
+    def _record(self, seen):
+        with open(draw.record_path(seen[0]), encoding="utf-8") as f:
+            return json.load(f)
+
+    def test_all_four_use_values_are_recorded(self):
+        for value in ("full", "cutout", "sheet", "alpha"):
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as d:
+                rc, _, _, seen = self._run(["--use", value], tmp=d)
+                self.assertEqual(rc, 0)
+                self.assertEqual(self._record(seen)["use"], value)
+
+    def test_use_absent_records_null(self):
+        with tempfile.TemporaryDirectory() as d:
+            rc, _, _, seen = self._run([], tmp=d)
+            self.assertEqual(rc, 0)
+            self.assertIsNone(self._record(seen)["use"])
+
+    def test_invalid_use_returns_2_and_lists_values(self):
+        with tempfile.TemporaryDirectory() as d, clean_env(IMAGE_API_KEY="sk-test-key"):
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                rc = draw.main(["a cat", "--use", "bogus"])
+        self.assertEqual(rc, 2)
+        for value in ("full", "cutout", "sheet", "alpha"):
+            self.assertIn(value, err.getvalue())
+
+    def test_record_fields_order_and_no_secrets(self):
+        with tempfile.TemporaryDirectory() as d:
+            ref = Path(d) / "r.png"
+            ref.write_bytes(_png_bytes(6))
+            rc, _, _, seen = self._run(["--use", "cutout", "--ref", str(ref)], tmp=d)
+            self.assertEqual(rc, 0)
+            path = draw.record_path(seen[0])
+            text = Path(path).read_text(encoding="utf-8")
+            record = json.loads(text)
+        self.assertEqual(list(record), [
+            "prompt", "model", "aspect", "quality", "background", "refs", "mask",
+            "use", "base", "task_id", "index", "image_url", "created_at", "seconds"])
+        self.assertEqual(record["prompt"], "a cat")
+        self.assertEqual(record["refs"], [os.path.abspath(str(ref))])
+        self.assertIsNone(record["mask"])
+        self.assertIsNone(record["quality"])
+        self.assertIsNone(record["background"])
+        self.assertEqual(record["base"], draw.DEFAULT_BASE)
+        self.assertEqual((record["task_id"], record["index"]), ("t-1", 1))
+        self.assertEqual(record["image_url"], "https://img/a.png")
+        self.assertRegex(record["created_at"],
+                         r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2}$")
+        self.assertIsInstance(record["seconds"], int)
+        self.assertNotIn("base64", text)
+        self.assertNotIn("sk-test-key", text)
+
+    def test_local_ref_recorded_as_abs_path(self):
+        with tempfile.TemporaryDirectory() as d:
+            Path(d, "r.png").write_bytes(_png_bytes(6))
+            orig_dir = os.getcwd()
+            os.chdir(d)
+            try:
+                rc, _, _, seen = self._run(["--ref", "r.png"], tmp=d)
+                record = self._record(seen)
+            finally:
+                os.chdir(orig_dir)
+            self.assertEqual(rc, 0)
+            self.assertTrue(os.path.isabs(record["refs"][0]))
+            self.assertTrue(os.path.samefile(record["refs"][0], os.path.join(d, "r.png")))
+
+    def test_url_only_writes_no_record(self):
+        with tempfile.TemporaryDirectory() as d:
+            out_dir = os.path.join(d, "out")
+            os.makedirs(out_dir)
+            orig_gen = draw.generate
+            draw.generate = lambda prompt, **kw: ("t", ["https://img/a.png"])
+            try:
+                with clean_env(IMAGE_API_KEY="sk-test-key"), \
+                        contextlib.redirect_stdout(io.StringIO()), \
+                        contextlib.redirect_stderr(io.StringIO()):
+                    rc = draw.main(["a cat", "--url-only", "--use", "full", "--out", out_dir])
+            finally:
+                draw.generate = orig_gen
+            self.assertEqual(rc, 0)
+            self.assertEqual([p for p in os.listdir(out_dir) if p.endswith(".json")], [])
+
+    def test_record_write_failure_warns_but_returns_0(self):
+        with tempfile.TemporaryDirectory() as d:
+            out_dir = os.path.join(d, "out")
+            os.makedirs(out_dir)
+            seen = []
+
+            def fake_download(url, out, tid, idx, **kw):
+                p = os.path.join(out, f"draw-{tid}-{idx}.png")
+                Path(p).write_bytes(b"img")
+                os.chmod(out, 0o500)  # 图片已落盘；接着写记录会被权限拦下
+                seen.append(p)
+                return p
+
+            orig_gen, orig_dl = draw.generate, draw.download
+            draw.generate = lambda prompt, **kw: ("t", ["https://img/a.png"])
+            draw.download = fake_download
+            out, err = io.StringIO(), io.StringIO()
+            try:
+                with clean_env(IMAGE_API_KEY="sk-test-key"):
+                    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                        rc = draw.main(["a cat", "--out", out_dir])
+            finally:
+                draw.generate, draw.download = orig_gen, orig_dl
+                os.chmod(out_dir, 0o700)  # 还回写权限，TemporaryDirectory 才能清理
+            self.assertEqual(rc, 0)
+            self.assertIn("警告", err.getvalue())
+            self.assertEqual(out.getvalue(), seen[0] + "\n")  # stdout 仍只有图片路径
+            self.assertEqual([p for p in os.listdir(out_dir) if p.endswith(".json")], [])
+
+    def test_list_models_with_invalid_use_returns_2(self):
+        with clean_env():
+            err = io.StringIO()
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+                rc = draw.main(["--list-models", "--use", "bogus"])
+        self.assertEqual(rc, 2)
+        self.assertIn("full", err.getvalue())
+
+    def test_seconds_count_retries_from_first_request(self):
+        with tempfile.TemporaryDirectory() as d:
+            out_dir = os.path.join(d, "out")
+            os.makedirs(out_dir)
+            calls = {"n": 0}
+            seen = []
+
+            def fake_generate(prompt, **kw):
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    raise draw.DrawError("生成失败: error", reason="error")
+                return ("t-1", ["https://img/a.png"])
+
+            def fake_download(url, out, tid, idx, **kw):
+                p = os.path.join(out, f"draw-{tid}-{idx}.png")
+                Path(p).write_bytes(b"img")
+                seen.append(p)
+                return p
+
+            values = iter([100.0, 130.0, 130.0, 130.0])  # 起跑 100，写记录时 130
+            orig_gen, orig_dl, orig_time = draw.generate, draw.download, draw.time
+            draw.generate = fake_generate
+            draw.download = fake_download
+            draw.time = types.SimpleNamespace(monotonic=lambda: next(values))
+            try:
+                with clean_env(IMAGE_API_KEY="sk-test-key"):
+                    with contextlib.redirect_stdout(io.StringIO()), \
+                            contextlib.redirect_stderr(io.StringIO()):
+                        rc = draw.main(["a cat", "--out", out_dir])
+            finally:
+                draw.generate, draw.download, draw.time = orig_gen, orig_dl, orig_time
+            self.assertEqual((rc, calls["n"]), (0, 2))  # 重试过一次
+            self.assertEqual(self._record(seen)["seconds"], 30)  # 含失败那次
+
+    def test_use_does_not_change_request_body(self):
+        bodies = []
+
+        def fake_post(url, key, body, **kw):
+            bodies.append(body)
+            return iter(['data: {"status":"succeeded","id":"t",'
+                         '"results":[{"url":"https://img/a.png"}]}'])
+
+        orig_post, orig_dl = draw._http_post_stream, draw.download
+        draw._http_post_stream = fake_post
+        draw.download = lambda url, out, tid, idx, **kw: os.devnull
+        try:
+            with tempfile.TemporaryDirectory() as d, clean_env(IMAGE_API_KEY="sk-test-key"):
+                for extra in ([], ["--use", "sheet"]):
+                    with contextlib.redirect_stdout(io.StringIO()), \
+                            contextlib.redirect_stderr(io.StringIO()):
+                        rc = draw.main(["a cat", *extra, "--out", d])
+                    self.assertEqual(rc, 0)
+        finally:
+            draw._http_post_stream, draw.download = orig_post, orig_dl
+        self.assertEqual(len(bodies), 2)
+        self.assertEqual(bodies[0], bodies[1])
+        self.assertEqual(bodies[0], {"model": "gpt-image-2", "prompt": "a cat",
+                                     "aspectRatio": "1024x1024", "shutProgress": False})
 
 
 if __name__ == "__main__":
